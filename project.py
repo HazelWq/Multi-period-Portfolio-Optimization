@@ -228,14 +228,13 @@ class MPC:
         # Objective function
         objective = cp.Maximize(returns - self.__gammaRisk * risk - self.__gammaTrade * transaction_cost)
         # Constraints
-        constraints = [pi[:, t] >= epsilon for t in range(self.__H)] + [cp.sum(pi[:, t]) == 1 for t in range(self.__H)]
+        constraints = [epsilon <= pi] + [pi <= 0.4] + [cp.sum(pi[:, t]) == 1 for t in range(self.__H)]
         # Solve the problem
         problem = cp.Problem(objective, constraints)
         problem.solve()
         # Check if the problem has converged
         if problem.status not in ["infeasible", "unbounded"]:
             # The problem has an optimal solution
-            print(f"Problem solved successfully with status: {problem.status}")
             return pi.T.value[0]  # 我们只需要t+1的结果，对于t+2需要更新模型
         else:
             # The problem does not have an optimal solution
