@@ -11,11 +11,11 @@ class GHMM:
     # Constructor: initialize the dataframe and the GHMM
     def __init__(self, df):
         # Set a seed to ensure a consistent outcome.
-        np.random.seed(int(time.time()))
+        # np.random.seed(int(time.time()))
         # Fill NaN values by the previous valid value: we assume the index do not change
         # Calculate returns
         self.__ret = df.sort_index().ffill().pct_change().dropna() * 100
-        self.__ghmm = hmm.GaussianHMM(n_components=2, n_iter=2_000, covariance_type='full')
+        self.__ghmm = hmm.GaussianHMM(n_components=2, n_iter=2_000, covariance_type='full', random_state=1)
         # Valid trading dates
         self.__tradingDates = self.__ret.index  # 暂时先使用这个，之后使用 'pandas_market_calendars' 生成将来的交易日
         # Training
@@ -92,7 +92,7 @@ class GHMM:
 
     # Proceed to the following date
     def updateModel(self):
-        self.__ghmm = hmm.GaussianHMM(n_components=2, n_iter=2_000, covariance_type='full')
+        self.__ghmm = hmm.GaussianHMM(n_components=2, n_iter=2_000, covariance_type='full', random_state=1)
         self.__date = self.__tradingDates[np.where(self.__tradingDates == self.__date)[0][0] + 1]
         self.trainingModel()  # 这里假设数据集是给定的，现实生活中的数据集需要收集当天的数据
         # 之后更改为给定数据加入到training中
@@ -165,7 +165,7 @@ class GHMM:
         sigma = []
         for i in range(len(q)):
             sigma.append((q[i] * self.__sigma_n
-                          + (1 - q[i]) * self.__sigma_c)
+                         + (1 - q[i]) * self.__sigma_c)
                          + q[i] * np.outer((self.__mu_n - mu[i]), (self.__mu_n - mu[i]))
                          + (1 - q[i]) * np.outer((self.__mu_c - mu[i]), (self.__mu_c - mu[i])))
         return sigma
@@ -174,6 +174,7 @@ class GHMM:
 class MPC:
     def __init__(self, model):
         self.__model = model
+        model.trainingModel()
         self.__H = None
         self.__mu = None
         self.__sigma = None
@@ -222,13 +223,13 @@ class MPC:
         # Objective function components
         returns = sum(self.__mu[t].T @ pi[:, t] for t in range(self.__H))
         risk = sum(cp.quad_form(pi[:, t], self.__sigma[t]) for t in range(self.__H))
-        epsilon = 1e-8
+        epsilon = 0.0001
         transaction_cost = sum(cp.norm1(pi[:, t] - pi[:, t - 1]) for t in range(1, self.__H))
         transaction_cost += cp.norm1(pi[:, 0] - pi_pre)  # Initial transaction cost
         # Objective function
         objective = cp.Maximize(returns - self.__gammaRisk * risk - self.__gammaTrade * transaction_cost)
         # Constraints
-        constraints = [epsilon <= pi] + [pi <= 0.4] + [cp.sum(pi[:, t]) == 1 for t in range(self.__H)]
+        constraints = [epsilon <= pi] + [cp.sum(pi[:, t]) == 1 for t in range(self.__H)]
         # Solve the problem
         problem = cp.Problem(objective, constraints)
         problem.solve()
@@ -246,6 +247,83 @@ class MPC:
         self.__model.updateModel()
         self.setH(self.__H)
 
+    def __optimization7(self, pi_pre, pi_t_1, Sigma_t, n, H, gamma_trade):
+        pi_t = cp.Variable((n, H))
+        I = np.eye(n)
+        ones = np.ones((n, 1))
+        constraints = [pi_t >= 0]
+        obj = 0
+        g_t = np.zeros((n, H))
+        for h in range(H):
+            Sigma_tau = Sigma_t[h, :, :]
+            pi_tau = pi_t[:, h].reshape((-1, 1))
+            pi_tau_1 = pi_t_1[:, h].reshape((-1, 1))
+            delta_tau = np.trace(Sigma_tau) / 40 / n
+            total = pi_tau_1.T @ Sigma_tau @ pi_tau_1
+
+            g_tau = np.multiply(pi_tau_1, Sigma_tau @ pi_tau_1) / total
+            g_t[:, h] = g_tau.reshape(n)
+
+            # A_tau = (np.diag(Sigma_tau@pi_tau_1)+Sigma_tau@np.vstack([pi_tau_1.T]*n))/total\
+            #        -2*np.multiply(pi_tau_1, Sigma_tau@pi_tau_1)@pi_tau_1.T@Sigma_tau/total**2
+            A_tau = (np.diag(Sigma_tau @ pi_tau_1) + n * pi_tau_1 @ ones.T @ Sigma_tau
+                     - 2 * n * g_tau @ pi_tau_1.T @ Sigma_tau) / total
+
+            Q_tau = 2 * A_tau.T @ A_tau + delta_tau * I
+            q_tau = 2 * A_tau.T @ g_tau - Q_tau @ pi_tau_1
+            if h == 0:
+                pi_p = pi_pre
+            else:
+                pi_p = pi_t[:, h - 1].reshape((-1, 1))
+            obj += 1 / 2 * cp.quad_form(pi_tau, Q_tau) + pi_tau.T @ q_tau + gamma_trade * cp.norm(pi_tau - pi_p, 1)
+
+            constraints.append(cp.sum(pi_tau) == 1)
+
+        prob = cp.Problem(cp.Minimize(obj), constraints=constraints)
+        prob.solve(solver='OSQP')
+
+        return pi_t.value, g_t
+
+    def withRiskParity(self, pi_pre, tol=0.001):
+        Sigma = np.array(self.__sigma)
+        gamma_trade = self.__gammaTrade
+        H = self.__H
+
+        k = 0  # iteration
+        gamma_k = 0.8  # gamma_0 in [0,1] adjustment speed
+
+        n = pi_pre.shape[0]
+        tol_obj_1 = 1
+        pi = np.array([1 / n] * n * H).reshape(n, H)
+        pi_k = pi.copy()
+
+        while True:
+            # set max iteration
+            if k > 1000:
+                print('Not converged')
+                print(tol_obj, abs(tol_obj_1))
+                break
+            # Solve Problem 7 and get optimal solution
+            pi_opt, g = self.__optimization7(pi_pre.reshape((10, 1)), pi_k, Sigma, n, H, gamma_trade)
+
+            # calculate tolerance of objective
+            tol_obj = g - pi
+            tol_obj = tol_obj ** 2
+            tol_obj = sum(sum(tol_obj))
+            if abs(tol_obj_1 - tol_obj) <= tol:
+                # print(f'converged in {k} iterations.')
+                break
+            tol_obj_1 = tol_obj
+
+            # update pi_k
+            pi_k = pi_opt
+            # update gamma_k+1
+            gamma_k = 1 - 0.0000001 * gamma_k
+
+            k += 1
+
+        return pi_k.T.reshape((self.__H, 10))[0]
+
 
 class PortfolioOptimization:
     def __init__(self, method, H, T, pi_pre):
@@ -257,20 +335,33 @@ class PortfolioOptimization:
         # The pre allocation
         self.__pi_pre = pi_pre
         # The allocation at the beginning of each period
-        self.__allocation = [pi_pre]
+        self.__allocation = [self.__pi_pre]
 
     # Execute the portfolio optimization
     # Note that, 0 means MPC with Mean-Variance; 1 means MPC with Risk Parity
     def excutePortOpt(self, opt=0, gamma_risk=0.0, gamma_trade=0.0):
+        self.__allocation = [self.__pi_pre]
         self.__method.setGammaRisk(gamma_risk)
         self.__method.setGammaTrade(gamma_trade)
         self.__method.setH(self.__H)
         if opt == 0:
             for i in range(self.__T):
-                self.__allocation.append(self.__method.withMeanVariance(self.__allocation[-1]))
+                pi = self.__method.withMeanVariance(self.__allocation[-1])
+                if pi is None:
+                    self.__allocation.append(self.__allocation[-1])
+                else:
+                    self.__allocation.append(pi)
                 self.__method.nextPeriod()
         else:
-            return None
+            for i in range(self.__T):
+                pi = self.__method.withRiskParity(self.__allocation[-1])
+                if pi is None:
+                    self.__allocation.append(self.__allocation[-1])
+                else:
+                    self.__allocation.append(pi)
+                self.__method.nextPeriod()
+
+
 
     # Return the allocations from time t
     def getAllocation(self):
@@ -284,22 +375,33 @@ def main():
     # Sort by date
     df = df.sort_index()
 
-    model = GHMM(df)
-    model.setDate(model.earliestDate())
-    model.trainingModel()
-    print(model.getDate())
+    T = 1256
+    date = df.index[2000:2000+T+1]
+    H = [1, 15]
+    gamma_risk = 5
+    gamma_trade = [0.01]
 
-    mpc = MPC(model)
-    mpc.setH(20)
-    mpc.setGammaRisk(0.1)
-    mpc.setGammaTrade(0.001)
-    pi = mpc.withMeanVariance(np.array([1/10] * 10))
-    print(pi)
+    for i in H:
+        for j in gamma_trade:
+            # Initialization GHMM model
+            model = GHMM(df)
+            model.setDate(model.earliestDate())
 
-    opt = PortfolioOptimization(mpc, 10, 50, np.array([1/10] * 10))
-    opt.excutePortOpt(gamma_risk=0.1, gamma_trade=0.0001)
-    for i in opt.getAllocation():
-        print(i)
+            # Initialization MPC method
+            mpc = MPC(model)
+
+            start = time.time()
+            mpc.setH(i)
+            mpc.setGammaRisk(gamma_risk)
+            mpc.setGammaTrade(j)
+            # pi = mpc.withMeanVariance(np.array([1/10] * 10))
+
+            opt = PortfolioOptimization(mpc, i, T, np.array([0.0]*df.shape[1]))
+            opt.excutePortOpt(opt=1, gamma_risk=gamma_risk, gamma_trade=j)
+            print(opt.getAllocation())
+            pd.DataFrame(data=opt.getAllocation(), columns=df.columns, index=date).to_csv(f'riskpi_H{i}_trade{j}.csv')
+            end = time.time()
+            print(f"finished, time usage {end - start} s")
 
 
 if __name__ == "__main__":
